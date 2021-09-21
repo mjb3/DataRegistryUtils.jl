@@ -1,13 +1,15 @@
 module DataPipeline
 
-import YAML
-import HTTP
-import JSON
-import FTPClient
-import SHA
-import Dates
-import CSV
-# import PrettyTables
+using YAML
+using HTTP
+using JSON
+using FTPClient
+using SHA
+using Dates
+using CSV
+using DataFrames
+using URIs
+using Plots
 
 const C_DEBUG_MODE = false
 # const API_ROOT = "https://data.scrc.uk/api/"
@@ -18,6 +20,7 @@ const API_ROOT = string(LOCAL_DR_STEM, ":8000", "/api/")
 
 const NS_ROOT = string(API_ROOT, "namespace/")
 const STR_ROOT = string(LOCAL_DR_PORTLESS, "storage_root/")
+const STR_MATCH = Regex(string(LOCAL_DR_STEM, ".*storage_root/"))
 const SL_ROOT = string(LOCAL_DR_PORTLESS, "storage_location/")
 const TF_ROOT = string(API_ROOT, "text_file/")
 # const OBJ_ROOT = string(API_ROOT, "object/")
@@ -50,20 +53,31 @@ function get_id_from_root(url::String, root::String)
     return replace(replace(url, root => ""), "/" => "")
 end
 
-## get file hash
+function get_id_from_root(url::String, root::Regex)
+    return replace(replace(url, root => s""), "/" => "")
+end
+
+"""
+    get_file_hash(fp)
+
+Get file hash
+"""
 function get_file_hash(fp::String)
-    fhash = open(fp) do f
-        # return bytes2hex(SHA.sha1(f))
-        return bytes2hex(SHA.sha2_256(f))
-    end
+    fhash = bytes2hex(SHA.sha2_256(fp))
     return fhash
 end
 
-## read data registry
+"""
+    http_get_json(url)
+
+Read data registry
+"""
 function http_get_json(url::String)
     url = replace(url, LOCAL_DR_PORTLESS => API_ROOT)
+    token = DataPipeline.get_access_token()
+    headers = Dict("Authorization" => token, "Content-Type" => "application/json")
     try
-        r = HTTP.request("GET", url)
+        r = HTTP.request("GET", url, headers)
         return JSON.parse(String(r.body))
     catch e
         msg = "couldn't connect to local web server... have you run the start script?"
@@ -73,18 +87,85 @@ function http_get_json(url::String)
     end
 end
 
-## upload to data registry
-function http_post_data(table::String, data, scrc_access_tkn::String)
+"""
+    http_post_data(table, data)
+
+Upload to data registry
+"""
+function http_post_data(table::String, data::Dict)
     url = string(API_ROOT, table, "/")
-    headers = Dict("Authorization"=>scrc_access_tkn, "Content-Type" => "application/json")
+    token = DataPipeline.get_access_token()
+    headers = Dict("Authorization" => token, "Content-Type" => "application/json")
     body = JSON.json(data)
-    C_DEBUG_MODE && println(" POSTing data to := ", url, ": \n ", body)
-    r = HTTP.request("POST", url, headers=headers, body=body)
-    resp = JSON.parse(String(r.body))
-    C_DEBUG_MODE && println(" - response: \n ", resp)
-    return resp
+    
+    query = convert_query(data)
+    r = DataPipeline.http_get_json("$url$query")
+
+    if r["count"] == 1
+        entry_url = r["results"][1]["url"]
+
+    elseif r["count"] == 0
+        r = HTTP.request("POST", url, headers=headers, body=body)
+        resp = String(r.body)
+        json_resp = JSON.parse(resp)
+        entry_url = json_resp["url"]
+    end
+
+    return entry_url
 end
 
+"""
+    get_entry(table, data)
+
+Use query to get entry from local registry
+"""
+function get_entry(table::String, data::Dict)
+    url = string(API_ROOT, table, "/")
+    query = convert_query(data)
+    r = DataPipeline.http_get_json("$url$query")
+
+    if r["count"] == 0 
+        return nothing
+    else        
+        entry_url = r["results"][1]["url"]
+        return entry_url
+    end
+end
+
+"""
+    get_entry(table, data)
+
+Use query to check whether entry exists in local registry
+"""
+function check_exists(table::String, data::Dict)
+    url = string(API_ROOT, table, "/")
+    query = convert_query(data)
+    r = DataPipeline.http_get_json("$url$query")
+    exists = r["count"]==0 ? false : true
+    return exists
+end
+
+"""
+    convert_query(data)
+
+Convert dictionary to url query.
+"""
+function convert_query(data::Dict) 
+    url = "?"
+    for (key, value) in data
+        if isa(value, Bool)
+            query = value
+        elseif all(contains.(value, API_ROOT))
+            query = extract_id(value)
+            query = isa(query, Vector) ? join(query, ",") : query
+        else
+            query = URIs.escapeuri(value)
+        end
+        url = "$url$key=$query&"
+    end
+    url = chop(url, tail = 1)
+    return url
+end
 ## register stuff:
 include("api_upload.jl")
 
@@ -153,24 +234,27 @@ end
 
 ## get storage location
 function get_storage_loc(obj_url)
-    resp = http_get_json(obj_url)                       # object
-    obj_desc = resp["description"]
-    resp = http_get_json(resp["storage_location"])      # storage location
-    sl_path = resp["path"]
-    sl_hash = resp["hash"]
-    sr_url = resp["storage_root"]
-    resp = http_get_json(sr_url)                        # storage root
-    return (sr_root=resp["root"], sr_url=sr_url, sl_path=sl_path, sl_hash=sl_hash,
+    obj_entry = http_get_json(obj_url)                       # object
+    obj_desc = obj_entry["description"]
+    sl_entry = http_get_json(obj_entry["storage_location"])      # storage location
+    sl_path = sl_entry["path"]
+    sl_hash = sl_entry["hash"]
+    sr_url = sl_entry["storage_root"]
+    sr_entry = http_get_json(sr_url)                        # storage root
+    return (sr_root=sr_entry["root"], sr_url=sr_url, sl_path=sl_path, sl_hash=sl_hash,
         description=obj_desc) #, rt_tp=get_storage_type(sr_url)
 end
 
 ## get object_component
 function add_object_component!(array::Array, obj_url::String, post_component::Bool, component=nothing)
+    # Post component to registry
     if post_component && !isnothing(component)  # post component
         body = (object=obj_url, name=component)
         rc = http_post_data("object_component", body)
     end
-    resp = http_get_json(obj_url)               # object
+    # Get object entry
+    resp = DataPipeline.http_get_json(obj_url)  # object
+    # Get component entry
     for i in length(resp["components"])         # all components
         if !post_component && !isnothing(component)
             rc = http_get_json(resp["components"][i])
@@ -354,72 +438,6 @@ function initialise_local_registry(out_dir::String = DATA_OUT; data_config=nothi
     return db
 end
 
-## public function DEPRECATED
-# - `use_sql`             -- load SQLite database and return connection (`true` by default.)
-# - `use_axis_arrays`     -- convert the output to AxisArrays, where applicable.
-# - `data_log_path`       -- filepath of .yaml access log.
-# """
-#     fetch_data_per_yaml(data_config, out_dir = "./out/"; ... )
-#
-# **DEPRECATED** - use `initialise_local_registry`
-#
-# Refresh and load data products from the SCRC data registry.
-#
-# Checks the file hash for each data product and downloads anew any that are determined to be out-of-date. Allowing that the function has been called previously (i.e. so that the data has already been downloaded,)
-#
-# **Parameters**
-# - `data_config`         -- the location of the .yaml config file.
-# - `out_dir`             -- the local system directory where data will be stored.
-#
-# **Named parameters**
-# - `offline_mode`        -- set `true` when the Data Registry's RESTful API is inaccessible, e.g. no internet connection.
-# - `sql_file`            -- (optional) SQL file for e.g. custom SQLite views, indexes, or whatever.
-# - `db_path`             -- (optionally) specify the filepath of the database to use (or create.)
-# - `force_db_refresh`    -- set `true` to overide file hash check on database inserts.
-# - `auto_logging`        -- set `true` to enable automatic data access logging.
-# - `verbose`             -- set to `true` to show extra output in the console.
-# """
-# function fetch_data_per_yaml(data_config::String, out_dir::String = DATA_OUT; offline_mode::Bool=false,
-#     sql_file::String="", db_path::String=db_path::String=get_df_db_path(out_dir, data_config),
-#     force_db_refresh::Bool=false, auto_logging::Bool=false, verbose::Bool=false)
-#
-#     # st = Dates.now()
-#     ## SQLite connection:
-#     function get_db()
-#         if offline_mode
-#             return init_yaml_db(db_path)    # refresh db views only
-#         else                                # online refresh:
-#             out_dir = string(rstrip(out_dir, '/'), "/")
-#             md = process_data_config_yaml(data_config, out_dir, verbose) # read yaml
-#             return load_data_per_yaml(md, db_path, force_db_refresh, verbose)
-#         end
-#     end
-#     ## initialise
-#     db = get_db()
-#     stmt = SQLite.Stmt(db, "INSERT INTO session(data_dir) VALUES(?)")
-#     SQLite.DBInterface.execute(stmt, (out_dir, ))
-#     auto_logging && initialise_data_log(db, offline_mode)
-#     if length(sql_file) > 0     # optional sql file
-#         print(" - running: ", sql_file)
-#         try
-#             proc_sql_file!(db, sql_file)
-#             println(" - done.")
-#         catch e
-#             println(" - SQL ERROR:\n -- ", e)
-#         end
-#     end
-#     return db
-#     # else                            # return data in memory
-#     #     output = Dict()
-#     #     for i in eachindex(md.dp_name)
-#     #         dp = read_data_product_from_file(md.dp_file[i]; verbose)
-#     #         output[md.dp_name[i]] = dp
-#     #     end
-#     #     write_log()
-#     #     return output
-#     # end
-# end
-
 ## db staging
 include("db_staging.jl")
 
@@ -445,5 +463,6 @@ export read_array, read_table, read_estimate, read_distribution
 export write_array, write_table, write_estimate, write_distribution
 export link_read, link_write
 export raise_issue
+export SEIRS_model, plot_SEIRS, convert_query
 
 end # module
